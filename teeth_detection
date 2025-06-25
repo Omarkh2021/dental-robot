@@ -1,0 +1,381 @@
+"""
+Dental Robot - Enamel Caries Detection and 3D Tracking
+-------------------------------------------------------
+Author: Omar Khaled Hassan
+GitHub: https://github.com/Omarkh2021/dental-robot/ 
+
+Description:
+This script uses a YOLO model to detect enamel caries in dental images or videos,
+estimates their 3D positions using camera calibration, and optionally controls servo
+motors to align with the detected positions.
+
+Requirements:
+- Python 3.x
+- OpenCV
+- torch
+- ultralytics
+- numpy
+- gpiozero (for Raspberry Pi control)
+
+License: MIT License 
+"""
+
+#from gpiozero import Servo, AngularServo
+from adafruit_pca9685 import PCA9685
+from board import SCL, SDA
+import busio
+from time import sleep
+import time
+import numpy as np
+from ultralytics import YOLO
+import random
+import colorsys
+import torch
+import cv2
+import os
+import glob
+import busio
+
+
+
+
+# Set random seed
+random.seed(2)
+
+class ObjectDetection:
+    def __init__(self, weights_path="/home/DOR/Desktop/Dental_project/send_rasp/best(1).pt"):
+        # Load Network
+        self.weights_path = weights_path
+
+        self.colors = self.random_colors(800)
+
+        # Load Yolo
+        self.model = YOLO(self.weights_path)
+        self.classes = self.model.names
+
+        # Load Default device
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        elif torch.cuda.is_available():
+            self.device = torch.device(0)
+        else:
+            self.device = torch.device("cpu")
+
+    def get_id_by_class_name(self, class_name):
+        for i, name in enumerate(self.classes.values()):
+            if name.lower() == class_name.lower():
+                return i
+        return -1
+
+    def random_colors(self, N, bright=False):
+        """
+        Generate random colors.
+        To get visually distinct colors, generate them in HSV space then
+        convert to RGB.
+        """
+        brightness = 255 if bright else 180
+        hsv = [(i / N + 1, 1, brightness) for i in range(N + 1)]
+        colors = list(map(lambda c: colorsys.hsv_to_rgb(*c), hsv))
+        random.shuffle(colors)
+        return colors
+
+    def detect(self, frame, imgsz=480, conf=0.40, nms=True, classes=None, device=None):
+        # Filter classes
+        filter_classes = classes if classes else None
+        device = device if device else self.device
+        # Detect objects
+        results = self.model.predict(source=frame, save=False, save_txt=False,
+                                     imgsz=imgsz,
+                                     conf=conf,
+                                     nms=nms,
+                                     classes=filter_classes,
+                                     half=False,
+                                     device=device)  # save predictions as labels
+
+        # Get the first result from the array as we are only using one image
+        result = results[0]
+        # Get bboxes
+        bboxes = np.array(result.boxes.xyxy.cpu(), dtype="int")
+        # Get class ids
+        class_ids = np.array(result.boxes.cls.cpu(), dtype="int")
+        # Get scores
+        # round score to 2 decimal places
+        scores = np.array(result.boxes.conf.cpu(), dtype="float").round(2)
+        print(scores)
+        
+        # Filter enamel caries detections to get the one with the highest score
+        enamel_caries_idx = np.where((class_ids == self.get_id_by_class_name("enamel caries")) & (scores > 0.1))[0]
+        if len(enamel_caries_idx) > 0:
+            max_score_idx = np.argmax(scores[enamel_caries_idx])
+            enamel_caries_idx = enamel_caries_idx[max_score_idx]
+            bboxes = bboxes[[enamel_caries_idx]]
+            class_ids = class_ids[[enamel_caries_idx]]
+            scores = scores[[enamel_caries_idx]]
+           
+        return bboxes, class_ids, scores
+
+class ToothTracker:
+    def __init__(self, calib_data_path, square_size_cm=2.5):
+        self.square_size = square_size_cm
+        self.load_calibration_data(calib_data_path)
+
+    def load_calibration_data(self, path):
+        data = np.load(path)
+        self.cam_mat = data["camMatrix"]
+        self.dist_coef = data["distCoef"]
+        
+
+    def get_3d_position(self, bboxes, class_ids, scores, image):
+        enamel_2d = []
+        enamel_3d = []
+        
+
+        for bbox, class_id, score in zip(bboxes, class_ids, scores):
+            # Flatten the bbox in case it's nested
+            bbox = np.array(bbox).flatten()
+
+            if len(bbox) != 4:
+                print("⚠️ Invalid bbox:", bbox)
+                continue
+
+            x, y, x2, y2 = bbox
+
+            class_name = "enamel caries"  # or map class_id to name if needed
+            if score > 0.4 and class_name == "enamel caries":
+                cx, cy = (x + x2) // 2, (y + y2) // 2
+               #cv2.circle(image, (cx, cy), 4, (0, 0, 255), -1)
+
+                pixel_coords = np.array([(cx, cy)], dtype=np.float32)
+                undistorted_coords = cv2.undistortPoints(pixel_coords, self.cam_mat, self.dist_coef)
+                real_2d = undistorted_coords.reshape(1, 2) * self.square_size
+
+                perceived_width = x2 - x
+                focal_length = self.cam_mat[0, 0]
+                distance = (self.square_size * focal_length) / perceived_width
+
+                fx, fy = self.cam_mat[0, 0], self.cam_mat[1, 1]
+                cx_mat, cy_mat = self.cam_mat[0, 2], self.cam_mat[1, 2]
+
+                x_coord = (pixel_coords[0, 0] - cx_mat) * distance / fx
+                y_coord = (pixel_coords[0, 1] - cy_mat) * distance / fy
+                real_3d = np.array([x_coord, y_coord, distance])
+                #real_3d= np.array([distance,x_coord,y_coord])
+
+                enamel_2d.append(real_2d)
+                enamel_3d.append(real_3d)
+
+
+        return enamel_2d, enamel_3d
+
+    
+    def process_frame(frame, detector, tracker, compute_3d_for_id, label, frame_center=None):
+        frame = cv2.flip(frame, 1)
+        if frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+        # Detect all objects
+        bboxes, class_ids, scores = detector.detect(frame, classes=None)  # detect ALL classes
+
+        text = "Not Detected"
+        offset = None
+        positions_3d = []
+
+        if len(bboxes) > 0:
+            # Only calculate 3D positions for selected class (e.g. "teeths")
+            positions_3d_all = tracker.get_3d_position(bboxes, class_ids, scores, frame)
+
+            for i, (bbox, class_id, score) in enumerate(zip(bboxes, class_ids, scores)):
+                x, y, x2, y2 = bbox
+                color = detector.colors[class_id]
+                class_name = detector.classes[class_id]
+
+                cv2.rectangle(frame, (x, y), (x2, y2), color, 2)
+                cv2.putText(frame, class_name, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+                if class_id in compute_3d_for_id and i < len(positions_3d_all[1]):
+                    pos = positions_3d_all[1][i]
+                    if len(pos) == 3:
+                        pos_text = f"({pos[2]:.1f}, {pos[0]:.1f}, {pos[1]:.1f})"
+                        #pos_text=f"({})
+                        cv2.putText(frame, pos_text, (x2, y2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                        text = pos_text
+                        positions_3d.append(pos)
+                        positions_3d_array = np.array(positions_3d)
+
+
+                        if frame_center is not None:
+                            bbox_center_x = (x + x2) // 2
+                            bbox_center_y = (y + y2) // 2
+                            offset = (bbox_center_x - frame_center[0], bbox_center_y - frame_center[1])
+
+        return frame, text, offset
+#########control servo
+
+'''
+class ServoControllerPCA9685:
+    def __init__(
+        self,
+        channel_x: int,  # 360° continuous rotation servo
+        channel_y: int,  # 180° positional servo
+        x_gain: float = 0.003,  # Base speed sensitivity for X
+        x_deadzone: float = 15,  # Pixels where X stops
+        x_stop_pulse: float = 1.5,  # Exact stop pulse (calibrate this)
+        y_step: float = 0.5,  # Reduced degrees per pixel for Y for smoother gentler movement
+        y_delay: float = 0.02,  # Slightly longer delay after Y movement for stability
+        y_min_pulse: float = 0.5,  # Minimum pulse for Y (0°)
+        y_max_pulse: float = 2.5,  # Maximum pulse for Y (180°)
+        target_distance: float = 20.0,  # Optimal target distance (mm)
+        distance_gain: float = 0.0005  # Smaller gain for distance control to move slower when far
+    ):
+        # Initialize PCA9685
+        i2c = busio.I2C(SCL, SDA)
+        self.pca = PCA9685(i2c)
+        self.pca.frequency = 50  # Standard servo frequency
+
+        # Servo channels
+        self.channel_x = channel_x
+        self.channel_y = channel_y
+
+        # X servo (continuous) parameters
+        self.x_gain = x_gain
+        self.x_deadzone = x_deadzone
+        self.x_stop_pulse = x_stop_pulse
+        self.x_min_pulse = 1.2  # Minimum rotation pulse
+        self.x_max_pulse = 1.8  # Maximum rotation pulse
+        self.x_is_stopped = True
+
+        # Y servo (positional) parameters
+        self.y_angle = 90  # Default center position
+        self.y_step = y_step
+        self.y_delay = y_delay
+        self.y_min_pulse = y_min_pulse
+        self.y_max_pulse = y_max_pulse
+
+        # Distance control
+        self.target_distance = target_distance
+        self.distance_gain = distance_gain
+
+        # Initialize servos
+        self.stop()
+
+    def _pulse_ms_to_pwm(self, ms):
+        """Convert pulse width in ms to PCA9685 duty cycle value"""
+        return int((ms / 20.0) * 0xFFFF)
+
+    def set_speed_x(self, offset_x: float, distance_mm: float = None):
+        """
+        Control continuous rotation servo based on horizontal offset.
+        Speed slows down linearly when target is far (distance > target_distance).
+        Stops servo if offset_x is None or in deadzone.
+        """
+        if offset_x is None or abs(offset_x) < self.x_deadzone:
+            self._stop_x()
+            return
+
+        # Base gain
+        gain = self.x_gain
+
+        # Adjust gain for distance to slow movement when far
+        if distance_mm:
+            # The further the distance from target_distance, the smaller the gain
+            # For example if distance is 2x target, speed halves
+            gain /= max(1.0, distance_mm / self.target_distance)
+
+        speed = -offset_x * gain  # Invert offset because of camera coordinates
+
+        pulse = self.x_stop_pulse + speed
+        pulse = max(self.x_min_pulse, min(self.x_max_pulse, pulse))
+
+        self.pca.channels[self.channel_x].duty_cycle = self._pulse_ms_to_pwm(pulse)
+        self.x_is_stopped = False
+
+    def set_angle_y(self, offset_y: float):
+        """
+        Control positional servo Y based on vertical offset.
+        Movement is scaled down to be smoother and slower.
+        """
+        if offset_y is None or abs(offset_y) < 1:  # Add small deadzone for Y to reduce jitter
+            # If offset negligible, do not move
+            return
+
+        angle_delta = offset_y * (self.y_step / 100.0)  # Smaller step for smooth gradual movement
+        target_angle = self.y_angle + angle_delta
+        target_angle = max(0, min(180, target_angle))
+
+        pulse = self.y_min_pulse + (target_angle / 180.0) * (self.y_max_pulse - self.y_min_pulse)
+        pulse = max(self.y_min_pulse, min(self.y_max_pulse, pulse))
+
+        self.pca.channels[self.channel_y].duty_cycle = self._pulse_ms_to_pwm(pulse)
+        self.y_angle = target_angle
+
+        sleep(self.y_delay)  # Allow servo to move without jitter
+
+    def _stop_x(self):
+        """Stop continuous rotation servo by setting to stop pulse."""
+        stop_pwm = self._pulse_ms_to_pwm(self.x_stop_pulse)
+        if not self.x_is_stopped:
+            self.pca.channels[self.channel_x].duty_cycle = stop_pwm
+            self.x_is_stopped = True
+
+    def stop(self):
+        """Stop both servos and center Y axis."""
+        self._stop_x()
+        self.set_angle_y(0)  # Center Y axis to 90 degrees
+        
+'''
+class ServoControllerPCA9685:
+    def __init__(self, channel_x=None, channel_y=None, i2c_address=0x40, frequency=50):
+        from adafruit_servokit import ServoKit
+        self.kit = ServoKit(channels=16, address=i2c_address)
+        self.channel_x = channel_x
+        self.channel_y = channel_y
+
+        # Default neutral angles
+        self.angle_x = 90
+        self.angle_y = 90
+        self.kit.servo[channel_x].angle = self.angle_x if channel_x is not None else None
+        self.kit.servo[channel_y].angle = self.angle_y if channel_y is not None else None
+
+        # Tuning variables
+        self.y_gain = 0.1  # Gain for tracking (adjust as needed)
+        self.y_offset_bias = 0  # Distance offset from center in pixels
+
+    def set_angle_y(self, offset_y):
+        """Moves the Y servo based on pixel offset from center + optional bias"""
+        if offset_y is None:
+            return
+        
+        # Calculate target angle using gain and bias
+        angle_change = offset_y * self.y_gain
+        target_angle = self.angle_y + angle_change
+
+        # Clamp angle within safe 0–180 range
+        target_angle = max(0, min(180, target_angle))
+        self.kit.servo[self.channel_y].angle = target_angle
+        self.angle_y = target_angle
+
+    def set_y_gain(self, gain):
+        """Adjust gain dynamically (optional external control)"""
+        self.y_gain = gain
+
+    def set_y_offset_bias(self, bias):
+        """Set a vertical bias to track slightly above/below center"""
+        self.y_offset_bias = bias
+
+    def stop(self):
+        if self.channel_x is not None:
+            self.kit.servo[self.channel_x].angle = 90
+        if self.channel_y is not None:
+            self.kit.servo[self.channel_y].angle = 90
+
+    def reset_y(self):
+        """Reset Y servo to neutral angle (90°)"""
+        self.kit.servo[self.channel_y].angle = 90
+        self.angle_y = 90
+
+
+# ---------------------------- Notes ---------------------------- #
+# ServoController class is available in comments. You may include it
+# in a separate module or re-enable it as needed for real-time motion control.
+
+# ---------------------------- End of Script ---------------------------- #
