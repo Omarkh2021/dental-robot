@@ -2,6 +2,11 @@
 ### 📌 Features (Continued)
 - **YOLOv11 Upgrade**: Enhanced object detection accuracy using the latest YOLOv11 model.
 - **LabVIEW Integration**: Control system integration with LabVIEW for real-time monitoring and diagnostics.
+  ![Uploading image.png…]()
+![Uploading image.png…]()
+![Uploading image.png…]()
+![Uploading image.png…]()
+
 
 ### 🧠 Technologies Used
 - Python, OpenCV, and MediaPipe for vision and detection
