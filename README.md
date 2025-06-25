@@ -9,9 +9,8 @@
 - Python, OpenCV, and MediaPipe for vision and detection
 - PyTorch/TensorFlow for AI models
 - YOLOv11 for advanced object detection
-- ROS (Robot Operating System) for robot control
 - LabVIEW for control system integration
-- Arduino or Raspberry Pi for servo control
+-  Raspberry Pi for servo control
 - Real-time safety monitoring with computer vision
 
 ### 📁 Project Structure
